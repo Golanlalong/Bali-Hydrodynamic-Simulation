@@ -1,0 +1,146 @@
+# ==========================================
+# 0. INSTALASI & PERSIAPAN LINGKUNGAN
+# ==========================================
+# Jalankan baris pip ini jika library belum terinstal di Colab kamu
+!pip install whitebox rasterio geopandas shapely scipy -q
+
+import os
+import whitebox
+import rasterio
+from rasterio.features import shapes
+import geopandas as gpd
+import warnings
+from shapely.errors import ShapelyDeprecationWarning
+
+# Abaikan peringatan depresi shapely agar terminal bersih
+warnings.filterwarnings("ignore", category=ShapelyDeprecationWarning)
+
+def setup_working_environment():
+    """Inisialisasi WhiteboxTools dan direktori kerja Google Drive"""
+    wbt = whitebox.WhiteboxTools()
+    wbt.set_verbose_mode(False)
+
+    # Menyesuaikan path ke Google Drive
+    work_dir = "/content/drive/MyDrive"
+    wbt.set_working_dir(work_dir)
+    return wbt, work_dir
+
+def run_hydrological_pipeline(wbt, work_dir, dem_input):
+    """Tahapan hidrologi raster: Breach Depressions -> D8 Flow Direction -> Basins"""
+    print("Tahap 1: Breach Depressions (Mengoptimalkan elevasi untuk hidrologi)...")
+    dem_breached = "01_dem_breached.tif"
+    wbt.breach_depressions(dem=dem_input, output=dem_breached)
+
+    print("Tahap 2: Menghitung Flow Direction (D8)...")
+    fdir_raster = "02_flow_direction.tif"
+    wbt.d8_pointer(dem=dem_breached, output=fdir_raster)
+
+    print("Tahap 3: Mendelineasi Seluruh Basin (Watershed) secara otomatis...")
+    basins_raster = "03_basins_raw.tif"
+    wbt.basins(d8_pntr=fdir_raster, output=basins_raster)
+
+    return os.path.join(work_dir, basins_raster)
+
+def raster_to_geodataframe(raster_path, nodata_val=None):
+    """Mengonversi raster batas DAS hasil delineasi menjadi vektor poligon"""
+    print("Tahap 4: Mengonversi raster batas DAS menjadi vektor poligon...")
+    with rasterio.open(raster_path) as src:
+        image = src.read(1)
+        transform = src.transform
+        crs = src.crs
+
+        # Buat mask untuk mengecualikan NoData dan background (nilai <= 0)
+        if nodata_val is not None:
+            mask = (image != nodata_val) & (image > 0)
+        else:
+            mask = image > 0
+
+        results = (
+            {'properties': {'gridcode': v}, 'geometry': s}
+            for i, (s, v)
+            in enumerate(shapes(image, mask=mask, transform=transform))
+        )
+
+        gdf = gpd.GeoDataFrame.from_features(list(results), crs=crs)
+        return gdf
+
+def eliminate_micro_catchments(gdf, min_area_km2=10.0, target_epsg=32750):
+    """Mengeliminasi poligon DAS < 10 km2 dengan menggabungkannya ke tetangga terbesar."""
+    print(f"Tahap 5: Membersihkan topologi dan mengeliminasi Micro-DAS (< {min_area_km2} km2)...")
+
+    # Reproyeksi ke UTM (EPSG:32750 untuk zona Bali/Indonesia bagian tengah) agar hitungan luas meter persegi presisi
+    if gdf.crs is None or gdf.crs.to_epsg() != target_epsg:
+        gdf = gdf.to_crs(epsg=target_epsg)
+
+    # Hitung luas awal dalam km2
+    gdf['area_km2'] = gdf.geometry.area / 10**6
+    initial_count = len(gdf)
+    print(f"Jumlah poligon DAS awal: {initial_count}")
+
+    iteration = 1
+    while (gdf['area_km2'] < min_area_km2).any():
+        idx_smallest = gdf[gdf['area_km2'] < min_area_km2]['area_km2'].idxmin()
+        smallest_geom = gdf.loc[idx_smallest, 'geometry']
+
+        # Cari tetangga menggunakan buffer 1 meter untuk mengatasi celah/sliver poligon kecil
+        neighbors = gdf[gdf.geometry.intersects(smallest_geom.buffer(1))]
+        neighbors_idx = [i for i in neighbors.index if i != idx_smallest]
+
+        if neighbors_idx:
+            # Temukan tetangga yang berbatasan dengan area terbesar
+            largest_neighbor_idx = gdf.loc[neighbors_idx, 'area_km2'].idxmax()
+
+            # Union geometri poligon mikro ke tetangga dominannya
+            merged_geom = smallest_geom.union(gdf.loc[largest_neighbor_idx, 'geometry'])
+            gdf.loc[largest_neighbor_idx, 'geometry'] = merged_geom
+
+            # Hapus poligon mikro yang sudah digabung
+            gdf = gdf.drop(index=idx_smallest)
+            gdf['area_km2'] = gdf.geometry.area / 10**6
+        else:
+            # Jika poligon benar-benar terisolasi, lewati agar tidak infinite loop
+            gdf.loc[idx_smallest, 'area_km2'] = min_area_km2 + 0.1
+
+        if iteration % 100 == 0:
+            print(f"Iterasi ke-{iteration}: Tersisa {len(gdf)} DAS...")
+        iteration += 1
+
+    print(f"Proses eliminasi selesai! Jumlah DAS akhir: {len(gdf)} (Tereduksi {initial_count - len(gdf)} poligon)")
+    return gdf
+
+# ==========================================
+# EKSEKUSI UTAMA (MAIN SCRIPT)
+# ==========================================
+if __name__ == "__main__":
+    # 1. Konfigurasi Awal
+    wbt, work_dir = setup_working_environment()
+
+    # Nama file DEM mentah milikmu di Google Drive
+    dem_input_file = "DEM BALI BARU.tif"
+    output_shapefile_name = "Batas_DAS_Bali_Cleaned_10km2.shp"
+
+    # Parameter Analisis
+    MIN_AREA_THRESHOLD_KM2 = 10.0
+    UTM_ZONE_EPSG = 32750 # UTM Zone 50S untuk wilayah Bali
+
+    print(f"Memulai proses pemodelan otomatis untuk: {dem_input_file}")
+
+    # 2. Jalankan Rangkaian Hidrologi Raster (WhiteboxTools)
+    basins_raster_path = run_hydrological_pipeline(wbt, work_dir, dem_input_file)
+
+    # 3. Konversi Raster Basin ke Vektor Poligon
+    gdf_raw_vectors = raster_to_geodataframe(basins_raster_path)
+
+    # 4. Eliminasi Micro-DAS di bawah ambang batas
+    gdf_final_cleaned = eliminate_micro_catchments(
+        gdf_raw_vectors,
+        min_area_km2=MIN_AREA_THRESHOLD_KM2,
+        target_epsg=UTM_ZONE_EPSG
+    )
+
+    # 5. Ekspor Hasil Akhir ke Google Drive
+    final_output_path = os.path.join(work_dir, output_shapefile_name)
+    gdf_final_cleaned.to_file(final_output_path)
+
+    print(f"\nSELURUH PROSES BERHASIL!")
+    print(f"File Shapefile final tersimpan di direktori: {final_output_path}")
